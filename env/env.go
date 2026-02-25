@@ -1,6 +1,6 @@
 package env
 
 var (
-	TodoFileName = "todos.json"
+	TodoFileName = "weekt-cli-todos.json"
 	AppName      = "WEEKT-CLI"
 )

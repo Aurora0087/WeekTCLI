@@ -17,7 +17,7 @@ var todoList todo.List
 func main() {
 	todoList.Load(env.TodoFileName)
 
-	var rootCmd = &cobra.Command{Use: "ctweek"}
+	var rootCmd = &cobra.Command{Use: "weektcli"}
 
 	// --- EXISTING ADD COMMAND ---
 	var someday bool

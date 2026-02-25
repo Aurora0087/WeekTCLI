@@ -34,16 +34,18 @@ var (
 	CardBackgroundColor = lipgloss.Color("#1a212b")
 	CardForegroundColor = lipgloss.Color("#ffffff")
 
-	columnMaxWidth = 42
+	columnMaxWidth  = 42
+	columnMaxHeight = 19
 
 	// UI Styles
 	columnStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color(PrimaryColor)).
 			Padding(0, 1).
-			Width(columnMaxWidth-2).
+			Width(columnMaxWidth - 2).
 			MaxWidth(columnMaxWidth).
-			Height(22)
+			Height(columnMaxHeight - 2).
+			MaxHeight(columnMaxHeight)
 
 	todayStyle = columnStyle.
 			BorderForeground(todayDayColor)
@@ -153,6 +155,21 @@ var (
 			Foreground(PrimaryColor).
 			Width(4).
 			Align(lipgloss.Center)
+
+	ruleActiveStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color(SecondaryColor)).
+			Foreground(lipgloss.Color(SecondaryForeground)).
+			Padding(0, 1).Bold(true)
+
+	ruleInactiveStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("#27272a")).
+				Foreground(lipgloss.Color("#ffffff")).
+				Padding(0, 1)
+
+	ruleFocusStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(lipgloss.Color(SecondaryColor)).
+			PaddingLeft(2)
 )
 
 //---------------------------------------------------------------------------------------------------------------------------------
@@ -181,14 +198,24 @@ type Model struct {
 	pickerMonth                time.Month
 	pickerYear                 int
 
+	showRecurrenceRuleDialog bool
+	ruleFocus                int
+	ruleWeekdayCursor        int
+	tempRule                 todo.RecurrenceRule
+
 	terminalW int
 	terminalH int
+
+	columnMaxWidth  int
+	columnMaxHeight int
 }
 
 //---------------------------------------------------------------------------------------------------------------------------------
 
 func (m Model) getTasksForDay(day int) []todo.Item {
 	var filtered []todo.Item
+
+	// 1. Handle Someday
 	if day == 7 {
 		for _, it := range *m.todoList {
 			if it.IsSomeday {
@@ -198,9 +225,122 @@ func (m Model) getTasksForDay(day int) []todo.Item {
 		return filtered
 	}
 
-	targetDate := m.weekStart.AddDate(0, 0, day).Format("2006-01-02")
+	// 2. Normalize Target Date to Midnight (Prevents hour/minute math issues)
+	tY, tM, tD := m.weekStart.AddDate(0, 0, day).Date()
+	targetDate := time.Date(tY, tM, tD, 0, 0, 0, 0, time.Local)
+	targetDateStr := targetDate.Format("2006-01-02")
+
 	for _, it := range *m.todoList {
-		if !it.IsSomeday && it.Date.Format("2006-01-02") == targetDate {
+		if it.IsSomeday {
+			continue
+		}
+
+		// Normalize Item Start Date to Midnight
+		sY, sM, sD := it.Date.Date()
+		startDate := time.Date(sY, sM, sD, 0, 0, 0, 0, time.Local)
+
+		isMatch := false
+
+		// --- Case A: One-time Task ---
+		if it.RecurrenceRule == nil {
+			if startDate.Equal(targetDate) {
+				isMatch = true
+			}
+		} else {
+			// --- Case B: Recurring Task ---
+
+			// Never show before the start date
+			if targetDate.Before(startDate) {
+				continue
+			}
+
+			rule := it.RecurrenceRule
+			interval := int(rule.Interval)
+			if interval <= 0 {
+				interval = 1
+			}
+
+			// Use integer division on days for DST safety
+			daysDiff := int(targetDate.Sub(startDate).Hours() / 24)
+
+			switch rule.Freq {
+			case todo.Daily:
+				if daysDiff%interval == 0 {
+					isMatch = true
+				}
+
+			case todo.Weekly:
+				weekdayMatch := false
+
+				// If no weekdays were selected (null/empty),
+				// default to the weekday of the task's original start date.
+				if len(rule.Weekdays) == 0 {
+					if targetDate.Weekday() == startDate.Weekday() {
+						weekdayMatch = true
+					}
+				} else {
+					// Normal matching logic
+					for _, wd := range rule.Weekdays {
+						if wd == targetDate.Weekday() {
+							weekdayMatch = true
+							break
+						}
+					}
+				}
+
+				if weekdayMatch {
+					// Calculate weeks diff safely
+					weeksDiff := daysDiff / 7
+					if weeksDiff%interval == 0 {
+						isMatch = true
+					}
+				}
+			case todo.Monthly:
+				// 1. Calculate how many months have passed since the start date
+				startYear, startMonth, startDay := startDate.Date()
+				targetYear, targetMonth, targetDay := targetDate.Date()
+
+				// Formula for total months difference: (YearDiff * 12) + MonthDiff
+				monthsDiff := (targetYear-startYear)*12 + int(targetMonth-startMonth)
+
+				// 2. Check if the month hits our interval (e.g., every 1 month, every 3 months)
+				if monthsDiff >= 0 && monthsDiff%interval == 0 {
+
+					// 3. Check if today's day (e.g., the 26th) matches the target day
+					// If MonthDay is 0 (default), use the day from the task's original start date
+					matchDay := int(rule.MonthDay)
+					if matchDay <= 0 {
+						matchDay = startDay
+					}
+
+					// Handle the match
+					if targetDay == matchDay {
+						isMatch = true
+					} else {
+						// OPTIONAL: "End of month" safety.
+						// If the task is set for the 31st, but this month only has 30 days,
+						// show it on the last day of the month.
+						lastDayOfMonth := time.Date(targetYear, targetMonth+1, 0, 0, 0, 0, 0, time.Local).Day()
+						if matchDay > lastDayOfMonth && targetDay == lastDayOfMonth {
+							isMatch = true
+						}
+					}
+				}
+			}
+
+			// Handle Completion for Recurring Tasks
+			if isMatch {
+				it.Done = false // The master 'Done' is ignored for recurring instances
+				for _, doneDate := range rule.DoneList {
+					if doneDate == targetDateStr {
+						it.Done = true
+						break
+					}
+				}
+			}
+		}
+
+		if isMatch {
 			filtered = append(filtered, it)
 		}
 	}
@@ -240,6 +380,10 @@ func InitialModel(l *todo.List) Model {
 		showEditTask:               false,
 		showMoveDialog:             false,
 		showMoveDialogWithCalender: false,
+		ruleFocus:                  0,
+		ruleWeekdayCursor:          1,
+		columnMaxWidth:             columnMaxWidth,
+		columnMaxHeight:            columnMaxHeight,
 	}
 }
 
@@ -407,6 +551,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.todoList.Save(env.TodoFileName)
 				m.showMoveDialog = false
 				return m, nil
+			case "t":
+				now := time.Now()
+				for i := range *m.todoList {
+					if (*m.todoList)[i].ID == m.editingTaskID {
+						(*m.todoList)[i].IsSomeday = false
+						(*m.todoList)[i].Date = now
+						break
+					}
+				}
+				m.todoList.Save(env.TodoFileName)
+				m.showMoveDialog = false
+				return m, nil
 			case "c":
 				now := time.Now()
 				m.pickerDay = now.Day()
@@ -466,22 +622,124 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "enter":
 				targetDate := time.Date(m.pickerYear, m.pickerMonth, m.pickerDay, 0, 0, 0, 0, time.Local)
+
 				for i := range *m.todoList {
 					if (*m.todoList)[i].ID == m.editingTaskID {
-						(*m.todoList)[i].Date = targetDate
-						(*m.todoList)[i].IsSomeday = false
+						item := &(*m.todoList)[i]
+
+						item.Date = targetDate
+						item.IsSomeday = false
+
+						if item.RecurrenceRule != nil {
+							switch item.RecurrenceRule.Freq {
+
+							case todo.Weekly:
+								item.RecurrenceRule.Weekdays = []time.Weekday{targetDate.Weekday()}
+
+							case todo.Monthly:
+								item.RecurrenceRule.MonthDay = uint8(targetDate.Day())
+							}
+						}
 						break
 					}
 				}
+
 				m.todoList.Save(env.TodoFileName)
 				m.showMoveDialogWithCalender = false
 				return m, nil
 			}
 
-			// Important: If we changed months, ensure the cursor isn't on day 31 of a 30-day month
 			newDaysInMonth := time.Date(m.pickerYear, m.pickerMonth+1, 0, 0, 0, 0, 0, time.Local).Day()
 			if m.pickerDay > newDaysInMonth {
 				m.pickerDay = newDaysInMonth
+			}
+		} else if m.showRecurrenceRuleDialog {
+			switch msg.String() {
+			case "esc":
+				m.showRecurrenceRuleDialog = false
+				return m, nil
+
+			case "tab":
+				m.ruleFocus = (m.ruleFocus + 1) % 2
+				return m, nil
+
+			case "left", "h":
+				switch m.ruleFocus {
+				case 0: // Change Frequency
+					if m.tempRule.Freq > 0 {
+						m.tempRule.Freq--
+					}
+				case 2: // Move Weekday Cursor
+					if m.ruleWeekdayCursor > 0 {
+						m.ruleWeekdayCursor--
+					}
+				}
+
+			case "right", "l":
+				switch m.ruleFocus {
+				case 0: // Change Frequency
+					if m.tempRule.Freq < 3 {
+						m.tempRule.Freq++
+					}
+				case 2: // Move Weekday Cursor
+					if m.ruleWeekdayCursor < 6 {
+						m.ruleWeekdayCursor++
+					}
+				}
+
+			case "up", "k":
+				if m.ruleFocus == 1 { // Increase Interval
+					m.tempRule.Interval++
+				}
+
+			case "down", "j":
+				if m.ruleFocus == 1 { // Decrease Interval
+					if m.tempRule.Interval > 1 {
+						m.tempRule.Interval--
+					}
+				}
+
+			case " ": // Toggle Weekday (Space)
+				if m.ruleFocus == 2 && m.tempRule.Freq == todo.Weekly {
+					// Map cursor (0-6) to time.Weekday (Mon=1 ... Sun=0)
+					// Go's Sunday is 0, Monday is 1
+					targetWD := time.Weekday((m.ruleWeekdayCursor + 1) % 7)
+
+					// Toggle logic
+					found := -1
+					for i, wd := range m.tempRule.Weekdays {
+						if wd == targetWD {
+							found = i
+							break
+						}
+					}
+
+					if found != -1 {
+						// Remove weekday
+						m.tempRule.Weekdays = append(m.tempRule.Weekdays[:found], m.tempRule.Weekdays[found+1:]...)
+					} else {
+						// Add weekday
+						m.tempRule.Weekdays = append(m.tempRule.Weekdays, targetWD)
+					}
+				}
+
+			case "enter":
+				// SAFETY: If Weekly mode is selected but NO weekdays are picked,
+				// add the weekday of the original task date automatically.
+				if m.tempRule.Freq == todo.Weekly && len(m.tempRule.Weekdays) == 0 {
+					// Find the original task in the list
+					for _, it := range *m.todoList {
+						if it.ID == m.editingTaskID {
+							m.tempRule.Weekdays = []time.Weekday{it.Date.Weekday()}
+							break
+						}
+					}
+				}
+
+				m.todoList.UpdateRecurrenceRule(m.editingTaskID, m.tempRule)
+				m.todoList.Save(env.TodoFileName)
+				m.showRecurrenceRuleDialog = false
+				return m, nil
 			}
 		} else {
 
@@ -534,6 +792,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					return m, nil
 				}
+			case "r": // Open Recurrence Settings
+				tasks := m.getTasksForDay(m.cursorDay)
+				if len(tasks) > 0 {
+					selected := tasks[m.cursorIdx]
+					m.editingTaskID = selected.ID
+
+					if selected.RecurrenceRule != nil {
+						m.tempRule = *selected.RecurrenceRule // Copy existing
+					} else {
+						// Create a default new rule
+						m.tempRule = todo.RecurrenceRule{
+							Freq:     todo.None,
+							Interval: 1,
+							Weekdays: []time.Weekday{},
+							DoneList: []string{},
+							MonthDay: 0,
+						}
+					}
+
+					m.showRecurrenceRuleDialog = true
+					m.ruleFocus = 0 // Start focus on Frequency
+				}
 			case "m":
 				tasks := m.getTasksForDay(m.cursorDay)
 				if len(tasks) > 0 && m.cursorIdx < len(tasks) {
@@ -547,12 +827,48 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case " ": // Toggle Task Done
+				tasks := m.getTasksForDay(m.cursorDay)
 				if len(tasks) > 0 && m.cursorIdx < len(tasks) {
-					targetID := tasks[m.cursorIdx].ID
+					selectedTask := tasks[m.cursorIdx]
+					targetID := selectedTask.ID
+
+					// Calculate the date string for the current day being toggled
+					// This is important because we need to know WHICH day of the recurring task we are finishing
+					targetDateStr := m.weekStart.AddDate(0, 0, m.cursorDay).Format("2006-01-02")
 
 					for i := range *m.todoList {
 						if (*m.todoList)[i].ID == targetID {
-							(*m.todoList)[i].Done = !(*m.todoList)[i].Done
+							item := &(*m.todoList)[i]
+
+							// --- CASE 1: Recurring Task ---
+							if item.RecurrenceRule != nil {
+								// Check if this date is already in the DoneList
+								foundIdx := -1
+								for idx, date := range item.RecurrenceRule.DoneList {
+									if date == targetDateStr {
+										foundIdx = idx
+										break
+									}
+								}
+
+								if foundIdx != -1 {
+									// Date found: Uncheck it (Remove from list)
+									item.RecurrenceRule.DoneList = append(
+										item.RecurrenceRule.DoneList[:foundIdx],
+										item.RecurrenceRule.DoneList[foundIdx+1:]...,
+									)
+								} else {
+									// Date not found: Check it (Add to list)
+									item.RecurrenceRule.DoneList = append(item.RecurrenceRule.DoneList, targetDateStr)
+								}
+
+							} else {
+								// --- CASE 2: One-time Task ---
+								item.Done = !item.Done
+							}
+
+							// Save immediately to persist the change
+							m.todoList.Save(env.TodoFileName)
 							break
 						}
 					}
@@ -691,7 +1007,7 @@ func splitAtVisual(s string, width int) (string, string) {
 
 func (m Model) renderDay(dayIdx int) string {
 	var dateLabel string
-	style := columnStyle
+	style := columnStyle.Width(m.columnMaxWidth - 2).Height(m.columnMaxHeight - 2)
 
 	if dayIdx == 7 {
 		dateLabel = "SOMEDAY"
@@ -699,7 +1015,7 @@ func (m Model) renderDay(dayIdx int) string {
 		d := m.weekStart.AddDate(0, 0, dayIdx)
 		dateLabel = d.Format("Monday, Jan 02")
 		if d.Format("2006-01-02") == time.Now().Format("2006-01-02") {
-			style = todayStyle
+			style = todayStyle.Height(m.columnMaxHeight - 2)
 		}
 	}
 
@@ -710,7 +1026,7 @@ func (m Model) renderDay(dayIdx int) string {
 
 	tasks := m.getTasksForDay(dayIdx)
 
-	const maxVisibleTasks = 18
+	var maxVisibleTasks = m.columnMaxHeight - (2 + 4)
 	var taskList strings.Builder
 
 	if len(tasks) == 0 {
@@ -752,7 +1068,7 @@ func (m Model) renderDay(dayIdx int) string {
 			line := fmt.Sprintf("%s %s", check, t.Task)
 
 			//truncate long task names
-			line = runewidth.Truncate(line, columnMaxWidth-(2+5), "…")
+			line = runewidth.Truncate(line, m.columnMaxWidth-(2+5), "…")
 
 			if m.cursorDay == dayIdx && m.cursorIdx == i {
 				taskList.WriteString(highlightedTask.Render("> "+line) + "\n")
@@ -863,10 +1179,61 @@ func (m Model) renderEditTaskDialog() string {
 	return dialogBoxStyle.Render(content)
 }
 
+func (m Model) renderUpdateRecurrenceRuleDialog() string {
+	// --- 1. FREQUENCY ROW ---
+	freqs := []string{"None", "Daily", "Weekly", "Monthly"}
+	var freqButtons []string
+	for i, f := range freqs {
+		str := f
+		style := ruleInactiveStyle
+
+		// Highlight if this is the currently selected frequency
+		if int(m.tempRule.Freq) == i {
+			style = ruleActiveStyle
+		}
+		// Add a special indicator if this specific row is focused
+		if m.ruleFocus == 0 && int(m.tempRule.Freq) == i {
+			str = "▶ " + str
+		}
+		freqButtons = append(freqButtons, style.Render(str))
+	}
+	freqRow := lipgloss.JoinHorizontal(lipgloss.Left, freqButtons...)
+	if m.ruleFocus == 0 {
+		freqRow = ruleFocusStyle.Render(freqRow)
+	}
+
+	// --- 2. INTERVAL ROW ---
+	unit := "days"
+	switch m.tempRule.Freq {
+	case todo.Weekly:
+		unit = "weeks"
+	case todo.Monthly:
+		unit = "months"
+	}
+	intervalStr := fmt.Sprintf("Repeat every: [ %d ] %s", m.tempRule.Interval, unit)
+	if m.ruleFocus == 1 {
+		intervalStr = pickerActiveStyle.Render(intervalStr)
+	}
+
+	// --- 4. ASSEMBLE ---
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		lipgloss.NewStyle().Bold(true).MarginBottom(1).Render("RECURRENCE SETTINGS"),
+		"Frequency:",
+		freqRow,
+		"",
+		intervalStr,
+		"",
+		footerStyle.Render("Tab: Move, ←→↑↓: Change Value, 󰆓 Enter: Save, 󰜺 Esc: Cancel"),
+	)
+
+	return dialogBoxStyle.Render(content)
+}
+
 func (m Model) renderMoveTaskDialog() string {
 	content := lipgloss.JoinVertical(lipgloss.Center,
 		lipgloss.NewStyle().Bold(true).Render("MOVE TASK"),
 		"",
+		fmt.Sprintf("Press %s to move to Today", choiceStyle.Render("t")),
 		fmt.Sprintf("Press %s to move to Someday", choiceStyle.Render("s")),
 		fmt.Sprintf("Press %s to choose a Date", choiceStyle.Render("c")),
 		"",
@@ -1005,14 +1372,37 @@ func (m Model) View() string {
 		m.weekStart.AddDate(0, 0, 6).Format("Jan 02, 2006"))
 	header := headerStyle.Render(env.AppName) + "  " + weekRange
 
-	// Grid
-	row1 := lipgloss.JoinHorizontal(lipgloss.Top, m.renderDay(0), m.renderDay(1), m.renderDay(2), m.renderDay(3), m.renderDay(4), m.renderDay(5))
-	row2 := lipgloss.JoinHorizontal(lipgloss.Top, m.renderDay(6), m.renderDay(7))
+	// grid
+	unitWidth := m.columnMaxWidth
 
-	grid := lipgloss.JoinVertical(lipgloss.Left, row1, row2)
+	colsPerRow := m.terminalW / unitWidth
+	if colsPerRow <= 2 {
+		m.columnMaxHeight = 14
+		colsPerRow = 2
+	} else {
+		m.columnMaxHeight = 19
+	}
+	if colsPerRow > 8 {
+		colsPerRow = 8
+	}
+
+	var rows []string
+	var currentRow []string
+
+	for i := 0; i < 8; i++ {
+		currentRow = append(currentRow, m.renderDay(i))
+
+		//if current row is full / we r at the very last box
+		if (i+1)%colsPerRow == 0 || i == 7 {
+			rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, currentRow...))
+			currentRow = []string{}
+		}
+	}
+
+	grid := lipgloss.JoinVertical(lipgloss.Left, rows...)
 
 	// Footer
-	helpText := "• ←/→: Day, ↑/↓: Task, Space: Toggle , n: Add Task, e: Edit Task, m:Move task, Delete/x: Delete task, [: Prev Week, ]: Next Week, Esc/q: Quit •"
+	helpText := "• ← →: Day, ↑ ↓: Task, Space: Toggle, n:  Add Task, e:  Edit Task, m:  Move task, r:  Recurrence Setting, Delete/x: 󰆴 Delete task, [: Prev Week, ]: Next Week, Esc/q: Quit •"
 	footer := footerStyle.Width(m.terminalW).MarginTop(1).Render(helpText)
 
 	mainView := lipgloss.JoinVertical(lipgloss.Left, header, grid, footer)
@@ -1094,6 +1484,19 @@ func (m Model) View() string {
 		return overlay(dimmedBG, taskMoveDialog, x, y)
 	} else if m.showMoveDialogWithCalender {
 		taskMoveDialog := m.renderMoveTaskDatePicker()
+
+		// Calculate the center position
+		fgWidth := lipgloss.Width(taskMoveDialog)
+		fgHeight := lipgloss.Height(taskMoveDialog)
+
+		// Calculate top-left corner for the dialog to be centered
+		x := (bgWidth - fgWidth) / 2
+		y := (bgHeight - fgHeight) / 2
+
+		// Return the overlaid result
+		return overlay(dimmedBG, taskMoveDialog, x, y)
+	} else if m.showRecurrenceRuleDialog {
+		taskMoveDialog := m.renderUpdateRecurrenceRuleDialog()
 
 		// Calculate the center position
 		fgWidth := lipgloss.Width(taskMoveDialog)
